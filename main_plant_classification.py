@@ -20,7 +20,7 @@ def train_plants():
         working_directory = "C:\\Users\\aditya\\Documents\\Projects\\TracedLight\\arcturus_lychee\\.tests\\results",
         best_metric       = 'top-1',
         higher_is_better  = True,
-        experiment_name   = 'PlanClassificaionBF16x3'
+        experiment_name   = 'Plant256'
     )
 
     # setup the model and device
