@@ -9,7 +9,7 @@ def train_plants():
     
     # general paramters
     device        = torch.device('cuda')
-    total_epochs  = 2
+    total_epochs  = 1
     batch_size    = 64
     total_workers = 8
     test_every_n  = 4
@@ -18,9 +18,9 @@ def train_plants():
     # setup the logger first
     logger = DirectoryTrainingLogger(
         working_directory = "C:\\Users\\aditya\\Documents\\Projects\\TracedLight\\arcturus_lychee\\.tests\\results",
-        best_metric       = 'accuracy',
+        best_metric       = 'top-1',
         higher_is_better  = True,
-        experiment_name   = 'PlanClassificaionBF16x2'
+        experiment_name   = 'PlanClassificaionBF16x3'
     )
 
     # setup the model and device
