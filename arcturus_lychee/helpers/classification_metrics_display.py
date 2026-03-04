@@ -21,7 +21,7 @@ def generate_confusion_matrix(x_true : list[int], y_pred : list[int], class_name
     suffix = "Actual \\ Prediction" 
 
     # 2. Generate the raw matrix
-    cm = confusion_matrix(x_true, y_pred, labels=labels)
+    cm = confusion_matrix(x_true, y_pred)
 
     # 3. Calculate dynamic padding
     # We want the cell width to be the max of (longest label length) or (longest number length)
@@ -33,7 +33,7 @@ def generate_confusion_matrix(x_true : list[int], y_pred : list[int], class_name
     report_lines = []
     
     # Header Row (Predicted labels)
-    header = suffix.ljust(padding) + "".join([f"{str(l).ljust(padding)}" for l in labels])
+    header = suffix.ljust(padding + 1) + "| " + "".join([f"{str(l).ljust(padding)}" for l in labels])
     report_lines.append(header)
     report_lines.append("-" * len(header)) # Separator line
     
