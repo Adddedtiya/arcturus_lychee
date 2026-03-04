@@ -18,7 +18,7 @@ def generate_confusion_matrix(x_true : list[int], y_pred : list[int], class_name
         labels = class_names
 
     # Header message
-    suffix = "Actual \ Prediction" 
+    suffix = "Actual \\ Prediction" 
 
     # 2. Generate the raw matrix
     cm = confusion_matrix(x_true, y_pred, labels=labels)
