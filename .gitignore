@@ -183,4 +183,5 @@ cython_debug/
 # local test subjects for sanity
 .tests
 
-
+# dont save to acturus lychee for main_*
+main_*.py

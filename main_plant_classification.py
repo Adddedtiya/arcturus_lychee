@@ -9,7 +9,7 @@ def train_plants():
     
     # general paramters
     device        = torch.device('cuda')
-    total_epochs  = 1
+    total_epochs  = 256
     batch_size    = 64
     total_workers = 8
     test_every_n  = 4
