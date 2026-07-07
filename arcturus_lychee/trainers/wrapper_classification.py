@@ -21,6 +21,7 @@ class WrapperForClassification:
             logger       : DirectoryTrainingLogger,
             total_epochs : int,
             device       : torch.device = 'cpu',
+            data_type    : torch.dtype  = torch.bfloat16
         ):
 
         # create the logger for the training session
@@ -42,8 +43,12 @@ class WrapperForClassification:
         self.criterion = nn.CrossEntropyLoss()
 
         # AMP for bfloat16 training (if cuda)
+        self.data_type = data_type
         self.use_amp = str(device).startswith('cuda')
-        self.gradient_scaler = GradScaler(self.device, enabled = self.use_amp)
+
+        # Grad Scaler for fp16 only !
+        self.use_grad_scaler = self.data_type == torch.float16
+        self.gradient_scaler = GradScaler(self.device, enabled = self.use_grad_scaler)
 
         # also save the amount epoch we want to train
         self.total_epochs = total_epochs
@@ -117,7 +122,7 @@ class WrapperForClassification:
         self.model.train()  
         
         # ensure we are using autocast AMP
-        with torch.autocast(device_type = str(self.device), dtype = torch.bfloat16, enabled = self.use_amp):
+        with torch.autocast(device_type = str(self.device), dtype = self.data_type, enabled = self.use_amp):
 
             # move the data to device
             input_tensor  = input_tensor.to(self.device)

@@ -186,3 +186,4 @@ cython_debug/
 # dont save to acturus lychee for main_*
 main_plant_classification.py
 main_*.py
+test_*
