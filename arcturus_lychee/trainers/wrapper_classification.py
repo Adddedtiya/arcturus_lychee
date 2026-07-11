@@ -11,24 +11,24 @@ from torch.amp.grad_scaler import GradScaler
 from arcturus_lychee.helpers import DirectoryTrainingLogger, SpeedTimer, generate_report, generate_confusion_matrix
 from torch.utils.data   import DataLoader
 from collections import defaultdict
-
 from typing import Union
+from arcturus_lychee.configuration import TrainingConfiguration
 
 class WrapperForClassification:
     def __init__(
             self,
             model        : nn.Module,
-            logger       : DirectoryTrainingLogger,
-            total_epochs : int,
-            device       : torch.device = 'cpu',
-            data_type    : torch.dtype  = torch.bfloat16
+            logger       : DirectoryTrainingLogger
         ):
 
         # create the logger for the training session
         self.log = logger
 
         # default device and ensure everything in the device
-        self.device = torch.device(device)
+        self.device = self.log.configuration_var.device
+
+        # also save the amount epoch we want to train
+        self.total_epochs = self.log.configuration_var.total_epochs
 
         # ensure model is device and the training code
         self.model = model.to(self.device)
@@ -37,21 +37,18 @@ class WrapperForClassification:
         self.optimizer = AdamW(self.model.parameters(), lr = 1e-5)
 
         # set the scheduler too
-        self.scheduler = CosineAnnealingLR(self.optimizer, T_max = total_epochs)
+        self.scheduler = CosineAnnealingLR(self.optimizer, T_max = self.total_epochs)
 
         # Cross Entropy Loss for Classification
         self.criterion = nn.CrossEntropyLoss()
 
         # AMP for bfloat16 training (if cuda)
-        self.data_type = data_type
-        self.use_amp = str(device).startswith('cuda')
+        self.data_type = self.log.configuration_var.dtype
+        self.use_amp = str(self.device).startswith('cuda')
 
         # Grad Scaler for fp16 only !
         self.use_grad_scaler = self.data_type == torch.float16
         self.gradient_scaler = GradScaler(self.device, enabled = self.use_grad_scaler)
-
-        # also save the amount epoch we want to train
-        self.total_epochs = total_epochs
 
     def save_state(self, fpath : str) -> None:
 

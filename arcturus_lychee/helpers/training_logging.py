@@ -3,22 +3,27 @@ import pandas as pd
 
 from datetime import datetime
 from typing   import Union
-
+from copy import deepcopy
 import matplotlib.pyplot as plt
+
+from arcturus_lychee.configuration import TrainingConfiguration, save_config
 
 class DirectoryTrainingLogger:
     def __init__(
-            self, 
-            working_directory : str, 
-            best_metric       : str, 
-            higher_is_better  : bool             = True,
-            experiment_name   : Union[str, None] = None
+            self,
+            configuration : TrainingConfiguration
         ):
 
-        # check if experiment_name is valid or not
-        experiment_name = experiment_name if experiment_name else datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+        # get current time
+        current_time = datetime.now().strftime("%Y_%m_%d_%H_%M")
+        
+        # setup experiment name
+        configuration.experiment_name = configuration.experiment_name.replace('-', '_')
+        configuration.experiment_name = configuration.experiment_name + "-" + current_time if configuration.append_date else configuration.experiment_name
+        experiment_name = configuration.experiment_name
 
         # root directory
+        working_directory = configuration.working_directory
         working_directory = os.path.join(working_directory, experiment_name)
         self.root_dir = os.path.abspath(working_directory)
         os.makedirs(self.root_dir, exist_ok = True)
@@ -29,8 +34,8 @@ class DirectoryTrainingLogger:
         self.eval_path  = os.path.join(self.log_dir, "eval.csv")
         
         # Internal Metrics keys
-        self.best_metric_key  = best_metric
-        self.higher_is_better = higher_is_better
+        self.best_metric_key  = configuration.metric_to_track
+        self.higher_is_better = configuration.higher_is_better
         
         # Internal flag to track the result of the most recent log call
         self._current_epoch = 0
@@ -48,6 +53,15 @@ class DirectoryTrainingLogger:
         self.samples_dir = self.__create_subdir('samples')
         self.weights_dir = self.__create_subdir("weights")
         self.plots_dir   = self.__create_subdir("plots")
+
+        # save the configuration file too
+        save_config(
+            config_obj = configuration,
+            filepath   = os.path.join(self.root_dir, 'configuration.toml')
+        )
+        
+        # now we keep a copy just in case
+        self.configuration_var = deepcopy(configuration)
 
         # Start Your Training
         self.log("Training Start !")
