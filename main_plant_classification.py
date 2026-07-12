@@ -1,11 +1,12 @@
 import torch
+
 from arcturus_lychee.configuration                         import TrainingConfiguration
 from arcturus_lychee.helpers.training_logging              import DirectoryTrainingLogger
-from arcturus_lychee.datasets.basic_classification_dataset import DirectoryClassification, transforms
-from arcturus_lychee.trainers.wrapper_classification       import WrapperForClassification
+from arcturus_lychee.datasets.basic_classification_dataset import DirectoryClassification
+from arcturus_lychee.trainers.basic_classification         import WrapperForClassification
 from arcturus_lychee.models.architecture.mobile_net        import BasicMobileNetV3
-
-
+from arcturus_lychee.datasets                              import heavy_aug
+from arcturus_lychee.helpers                               import set_seed
 def generic_model_training():
     
     # setup paramters
@@ -21,11 +22,17 @@ def generic_model_training():
     configuration.dataset_root_test  = "C:\\Users\\aditya\\Documents\\Projects\\TracedLight\\arcturus_lychee\\.tests\\example_dataset\\plant_classification\\test"
 
     # training configuration
-    configuration.total_epochs = 512
+    configuration.total_epochs = 8
     configuration.batch_size   = 32
 
     # model configuration
     configuration.model_output_class = 40
+
+    # seed everything BEFORE building the model / datasets / dataloaders so
+    # weight init and shuffling are reproducible. Use a seeded generator for the
+    # training loader so shuffling + (worker) augmentation are reproducible too.
+    set_seed(configuration.seed, configuration.deterministic)
+    data_generator = torch.Generator().manual_seed(configuration.seed)
 
     # setup the logger first
     logger = DirectoryTrainingLogger(configuration)
@@ -42,17 +49,16 @@ def generic_model_training():
     # create the dataset
     training_dataset = DirectoryClassification(
         root_dir_path = configuration.dataset_root_train,
-        augmentation  = [
-            transforms.RandomRotation(45),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomVerticalFlip(),
-        ] 
+        augmentation  = heavy_aug(),
+        seed          = configuration.seed
     )
     validation_dataset = DirectoryClassification(
-        root_dir_path = configuration.dataset_root_val
+        root_dir_path = configuration.dataset_root_val,
+        seed          = configuration.seed
     )
     testing_dataset = DirectoryClassification(
-        root_dir_path = configuration.dataset_root_test
+        root_dir_path = configuration.dataset_root_test,
+        seed          = configuration.seed
     )
 
     # create the main dataloades
@@ -60,6 +66,7 @@ def generic_model_training():
         batch_size    = configuration.batch_size,
         total_workers = configuration.total_workers,
         device        = configuration.device,
+        generator     = data_generator
     )
     eval_dataloader = validation_dataset.create_dataloader(
         batch_size    = configuration.batch_size,

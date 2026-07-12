@@ -20,3 +20,9 @@ from arcturus_lychee.helpers.classification_metrics_display import (
     generate_confusion_matrix,
     generate_report
 )
+
+# add support for seed
+from arcturus_lychee.helpers.reproducibility import (
+    set_seed, 
+    seed_worker
+)

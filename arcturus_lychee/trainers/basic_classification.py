@@ -1,18 +1,23 @@
-import numpy as np
-
 import torch
 import torch.nn             as nn
 import torch.nn.functional  as F
 
-from tqdm import tqdm
-from torch.optim import AdamW
+from torch.optim              import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.amp.grad_scaler import GradScaler
-from arcturus_lychee.helpers import DirectoryTrainingLogger, SpeedTimer, generate_report, generate_confusion_matrix
-from torch.utils.data   import DataLoader
+from torch.amp.grad_scaler    import GradScaler
+from torch.utils.data         import DataLoader
+
+from arcturus_lychee.helpers import (
+    DirectoryTrainingLogger,
+    SpeedTimer, 
+    generate_report, 
+    generate_confusion_matrix
+)
+
 from collections import defaultdict
-from typing import Union
-from arcturus_lychee.configuration import TrainingConfiguration
+from tqdm        import tqdm
+from typing      import Union
+
 
 class WrapperForClassification:
     def __init__(
@@ -23,18 +28,19 @@ class WrapperForClassification:
 
         # create the logger for the training session
         self.log = logger
+        self.configuration = self.log.configuration_var
 
         # default device and ensure everything in the device
-        self.device = self.log.configuration_var.device
+        self.device = self.configuration.device
 
         # also save the amount epoch we want to train
-        self.total_epochs = self.log.configuration_var.total_epochs
+        self.total_epochs = self.configuration.total_epochs
 
         # ensure model is device and the training code
         self.model = model.to(self.device)
 
         # create the optimizer
-        self.optimizer = AdamW(self.model.parameters(), lr = 1e-5)
+        self.optimizer = AdamW(self.model.parameters(), lr = self.configuration.learning_rate)
 
         # set the scheduler too
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max = self.total_epochs)
@@ -43,25 +49,33 @@ class WrapperForClassification:
         self.criterion = nn.CrossEntropyLoss()
 
         # AMP for bfloat16 training (if cuda)
-        self.data_type = self.log.configuration_var.dtype
+        self.data_type = self.configuration.dtype
         self.use_amp = str(self.device).startswith('cuda')
 
         # Grad Scaler for fp16 only !
         self.use_grad_scaler = self.data_type == torch.float16
         self.gradient_scaler = GradScaler(self.device, enabled = self.use_grad_scaler)
 
-    def save_state(self, fpath : str) -> None:
+    def save_state(self, fpath : str, epoch : int = 0) -> None:
 
-        # save the parameter states
+        # save the parameter states (incl. scheduler + epoch so training can resume)
         state = {
+            'epoch'           : int(epoch),
             'model_state'     : self.model.state_dict(),
             'optimizer_state' : self.optimizer.state_dict(),
+            'scheduler_state' : self.scheduler.state_dict(),
             'scaler_state'    : self.gradient_scaler.state_dict()
         }
         torch.save(state, fpath)
     
-    def load_state(self, fpath : str) -> None:
+    def load_state(self, fpath : str) -> int:
+        """Restore model / optimizer / scheduler / scaler and return the saved epoch.
 
+        To resume training:
+            last_epoch = wrapper.load_state(logger.get_weights_path("latest.pt"))
+            logger.load_from_csv()                      # restore metric history + best value
+            wrapper.run_everything(..., start_epoch = last_epoch + 1)
+        """
         # load the parameters
         state = torch.load(fpath, map_location = self.device, weights_only = True)
 
@@ -69,6 +83,12 @@ class WrapperForClassification:
         self.model.load_state_dict(state['model_state'], strict = True)
         self.optimizer.load_state_dict(state['optimizer_state'])
         self.gradient_scaler.load_state_dict(state['scaler_state'])
+
+        # scheduler / epoch may be absent in older checkpoints - stay tolerant
+        if state.get('scheduler_state') is not None:
+            self.scheduler.load_state_dict(state['scheduler_state'])
+
+        return int(state.get('epoch', 0))
     
     def __compute_top_n(self, x_real : torch.Tensor, y_pred : torch.Tensor, top_k : tuple[int, ...] = (1, 5)) -> dict[str, float]:
 
@@ -80,6 +100,13 @@ class WrapperForClassification:
 
         # sanity buffer
         with torch.no_grad():
+            # clamp k to the number of classes so e.g. top-5 on a binary /
+            # few-class model doesn't raise "selected index k out of range"
+            num_classes = y_pred.size(1)
+            top_k = tuple(k for k in top_k if k <= num_classes)
+            if not top_k:
+                return results
+
             max_k = max(top_k)
             batch_size = x_real.size(0)
 
@@ -129,9 +156,10 @@ class WrapperForClassification:
             prediction : torch.Tensor = self.model(input_tensor)
             loss : torch.Tensor = self.criterion(prediction, target_tensor)
         
-        # compute the loss and scale it back
-        loss = self.gradient_scaler.scale(loss)
-        loss.backward()
+        # scale the loss for the backward pass, but keep the original
+        # `loss` intact so we log the true (unscaled) value later
+        scaled_loss = self.gradient_scaler.scale(loss)
+        scaled_loss.backward()
 
         # step the optmizer too
         self.gradient_scaler.step(self.optimizer)
@@ -155,7 +183,7 @@ class WrapperForClassification:
         self.model.eval()
 
         # ensure we are in amp mode and no gradients
-        with torch.autocast(device_type = str(self.device), dtype = torch.bfloat16, enabled = self.use_amp), torch.no_grad():
+        with torch.autocast(device_type = str(self.device), dtype = self.data_type, enabled = self.use_amp), torch.no_grad():
 
             # move the data to device
             input_tensor  = input_tensor.to(self.device)
@@ -170,25 +198,40 @@ class WrapperForClassification:
         # return the metrics only
         return metrics
     
-    def __calculate_metric_averages(self, metrics : list[dict[str, float]]) -> dict[str, float]:
-        
-        # create default dictonary
-        averages = defaultdict(list)
-        for item in metrics:
+    def __calculate_metric_averages(
+            self,
+            metrics : list[dict[str, float]],
+            weights : Union[list[float], None] = None
+        ) -> dict[str, float]:
+
+        # nothing to average
+        if not metrics:
+            return {}
+
+        # default to equal weighting; pass per-batch sample counts to get a
+        # true sample-weighted mean (so a smaller final batch is not
+        # over-counted for loss / accuracy).
+        if weights is None:
+            weights = [1.0] * len(metrics)
+
+        weighted_sum  = defaultdict(float)
+        weight_totals = defaultdict(float)
+        for item, weight in zip(metrics, weights):
             for key, value in item.items():
-                averages[key].append(value)
-        
-        # compute the value for each item in dictonary
-        for key in averages:
-            averages[key] = float(sum(averages[key]) / len(averages[key]))
+                weighted_sum[key]  += value * weight
+                weight_totals[key] += weight
 
         # convert to normal dict before going back
-        return dict(averages)
+        return {
+            key: float(weighted_sum[key] / weight_totals[key])
+            for key in weighted_sum
+        }
 
     def train_single_epoch(self, dataloader : DataLoader, enable_tqdm : bool = True) -> dict[str, float]:
         
         # setup state and variables
         active_metrics = []
+        batch_sizes    = []
         self.model.train()
 
         # training loop
@@ -197,11 +240,12 @@ class WrapperForClassification:
             # forward pass
             batch_metrics = self.__train_single_batch(input_tensor, target_tensor)
             
-            # append
+            # append (track batch size for sample-weighted averaging)
             active_metrics.append(batch_metrics)
+            batch_sizes.append(input_tensor.size(0))
         
         # compute the average for all
-        batch_averages = self.__calculate_metric_averages(active_metrics)
+        batch_averages = self.__calculate_metric_averages(active_metrics, batch_sizes)
         return batch_averages
 
 
@@ -209,6 +253,7 @@ class WrapperForClassification:
         
         # setup states and variables
         active_metrics = []
+        batch_sizes    = []
         self.model.eval()
 
         # testing loop
@@ -217,11 +262,12 @@ class WrapperForClassification:
             # forward pass
             batch_metrics = self.__test_single_batch(input_tensor, target_tensor)
             
-            # append
+            # append (track batch size for sample-weighted averaging)
             active_metrics.append(batch_metrics)
+            batch_sizes.append(input_tensor.size(0))
         
         # compute the average for all
-        batch_averages = self.__calculate_metric_averages(active_metrics)
+        batch_averages = self.__calculate_metric_averages(active_metrics, batch_sizes)
         return batch_averages
     
     def __get_current_learning_rate(self) -> float:
@@ -308,13 +354,13 @@ class WrapperForClassification:
 
                 # write the model to file
                 best_model_path = self.log.get_weights_path('best.pt')
-                self.save_state(best_model_path)
+                self.save_state(best_model_path, epoch = current_epoch)
             
             # check if we need to save in the current epoch
             if (current_epoch % save_every) == 0 or (current_epoch == 0):
 
                 latest_model_path = self.log.get_weights_path("latest.pt")
-                self.save_state(latest_model_path)
+                self.save_state(latest_model_path, epoch = current_epoch)
             
             # estimate the total training time
             leftover_epochs = self.total_epochs - current_epoch
@@ -323,7 +369,7 @@ class WrapperForClassification:
 
         # save the model final state too
         final_model_path = self.log.get_weights_path("final.pt")
-        self.save_state(final_model_path)
+        self.save_state(final_model_path, epoch = self.total_epochs - 1)
 
         # yay
         self.log.print("Training is Complete !")
@@ -342,6 +388,7 @@ class WrapperForClassification:
 
         # internal accuracy report
         accuracy_reports : list[dict[str, float]] = []
+        batch_sizes      : list[float]            = []
 
         # write into log
         self.log.print("") # spacing...
@@ -351,7 +398,7 @@ class WrapperForClassification:
         for index, (input_tensor, target_tensor) in enumerate(tqdm(test_dataloader, disable = not enable_tqdm)):
 
             # ensure we are in amp mode and no gradients
-            with torch.autocast(device_type = str(self.device), dtype = torch.bfloat16, enabled = self.use_amp), torch.no_grad():
+            with torch.autocast(device_type = str(self.device), dtype = self.data_type, enabled = self.use_amp), torch.no_grad():
 
                 # move the data to device
                 input_tensor  : torch.Tensor = input_tensor.to(self.device)
@@ -363,6 +410,7 @@ class WrapperForClassification:
                 # mesure the top-k
                 top_k_values = self.__compute_top_n(target_tensor, prediction, top_k = (1, 3, 5))
                 accuracy_reports.append(top_k_values)
+                batch_sizes.append(input_tensor.size(0))
 
             # break down the prediction
             # target     : [N,]
@@ -375,8 +423,8 @@ class WrapperForClassification:
             preds = torch.argmax(prediction, dim = 1)
             predicted_results += preds.detach().cpu().tolist()
         
-        # compute the top-k
-        average_top_k = self.__calculate_metric_averages(accuracy_reports)
+        # compute the top-k (sample-weighted)
+        average_top_k = self.__calculate_metric_averages(accuracy_reports, batch_sizes)
         for top_k in average_top_k.keys():
             self.log.print(f"Accuracy in {top_k} : {average_top_k[top_k]:.2f}")
         self.log.print("")

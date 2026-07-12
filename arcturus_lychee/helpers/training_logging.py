@@ -14,12 +14,15 @@ class DirectoryTrainingLogger:
             configuration : TrainingConfiguration
         ):
 
-        # get current time
-        current_time = datetime.now().strftime("%Y_%m_%d_%H_%M")
-        
-        # setup experiment name
+        # ensure the format is correct first
         configuration.experiment_name = configuration.experiment_name.replace('-', '_')
-        configuration.experiment_name = configuration.experiment_name + "-" + current_time if configuration.append_date else configuration.experiment_name
+        
+        # get current time
+        current_time  = datetime.now().strftime("%Y_%m_%d_%H_%M")
+        prefixed_name = f"{current_time}-{configuration.experiment_name}"
+        
+        # setup the name
+        configuration.experiment_name = prefixed_name if configuration.prefix_date else configuration.experiment_name
         experiment_name = configuration.experiment_name
 
         # root directory

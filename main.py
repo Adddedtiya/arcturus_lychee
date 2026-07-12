@@ -1,10 +1,7 @@
 def main():
-    from arcturus_lychee.datasets.basic_classification_dataset import DirectoryClassification, transforms
+    from arcturus_lychee.datasets.basic_classification_dataset import DirectoryClassification
     dataset = DirectoryClassification(
-        root_dir_path = "C:\\Users\\aditya\\Documents\\Projects\\TracedLight\\arcturus_lychee\\.tests\\example_dataset\\LeafDataset\\validation",
-        augmentation  = [
-            transforms.Resize((256, 256))
-        ] 
+        root_dir_path = "C:\\Users\\aditya\\Documents\\Projects\\TracedLight\\arcturus_lychee\\.tests\\example_dataset\\LeafDataset\\validation"
     )   
 
     print(dataset.augmentation)
