@@ -38,7 +38,7 @@ class TrainingConfiguration:
     save_every_n  : int = 8
 
     # generic training hyperparameters
-    learning_rate = 1e-5
+    learning_rate : float = 1e-5
 
     # seed management
     seed          : int  = 42
