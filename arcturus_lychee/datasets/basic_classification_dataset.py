@@ -8,6 +8,7 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 from typing import Union
 from arcturus_lychee.helpers import scan_directory_for_images, seed_worker
 
@@ -103,23 +104,50 @@ class DirectoryClassification(Dataset):
             device        : torch.device = 'cpu', 
             shuffle       : bool = True, 
             persistent    : bool = True,
-            generator     : Union[torch.Generator, None] = None
+            generator     : Union[torch.Generator, None] = None,
+            distributed   : bool = False,
+            seed          : int  = 0,
+            drop_last     : bool = False,
         ) -> DataLoader:
+        """Build a DataLoader for this dataset.
+
+        Set ``distributed=True`` (only valid once a process group is initialised)
+        to shard the data across ranks with a ``DistributedSampler``. When a
+        sampler is attached, the DataLoader's own ``shuffle`` must be False - the
+        sampler owns shuffling - so we force it and let the sampler take the
+        requested ``shuffle`` instead. The trainer calls ``sampler.set_epoch()``
+        each epoch (via ``loader.sampler``) to reshuffle.
+
+        For validation / test, prefer ``distributed=False, shuffle=False``: eval
+        runs on rank 0 only, so a distributed sampler there would just drop data.
+        """
 
         # setup states
         currently_using_gpu = (str(device).startswith('cuda')) # for [cuda, cuda:0, cuda:N, ...]
         persistent_workers  = False if total_workers == 0 else persistent 
 
+        # optional per-rank sharding
+        sampler = None
+        if distributed:
+            sampler = DistributedSampler(
+                self,
+                shuffle   = shuffle,
+                seed      = seed,
+                drop_last = drop_last,
+            )
+
         # create the dataloader object
         data = DataLoader(
             self, 
             batch_size         = batch_size,
-            shuffle            = shuffle,
+            shuffle            = (shuffle if sampler is None else False),
+            sampler            = sampler,
             pin_memory         = currently_using_gpu,
             num_workers        = total_workers,
             persistent_workers = persistent_workers,
             worker_init_fn     = seed_worker if total_workers > 0 else None,
-            generator          = generator
+            generator          = generator,
+            drop_last          = drop_last,
         )
         return data
     

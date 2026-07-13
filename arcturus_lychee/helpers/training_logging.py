@@ -8,6 +8,25 @@ import matplotlib.pyplot as plt
 
 from arcturus_lychee.configuration import TrainingConfiguration, save_config
 
+
+class NullLogger:
+    """No-op stand-in used on non-main DDP ranks.
+
+    Letting non-main ranks hold one of these means the trainer never has to
+    sprinkle ``if is_main_process()`` around every log / append / save call:
+    the side-effecting methods simply do nothing off rank 0. Saving is still
+    additionally gated in the trainer, so ``get_weights_path`` here only needs
+    to return something harmless.
+    """
+    def log(self, *args, **kwargs) -> None:            pass
+    def print(self, *args, **kwargs) -> None:          pass
+    def print_lines(self, *args, **kwargs) -> None:    pass
+    def append(self, *args, **kwargs) -> None:         pass
+    def load_from_csv(self, *args, **kwargs) -> None:  pass
+    def is_best(self) -> bool:                         return False
+    def get_weights_path(self, file_name : str) -> str: return file_name
+
+
 class DirectoryTrainingLogger:
     def __init__(
             self,
@@ -155,7 +174,7 @@ class DirectoryTrainingLogger:
         return self._last_was_best
 
     def load_from_csv(self):
-        """Loads data from CSVs and restores best_value accurately."""
+        """Loads data from CSVs and restores best_value + epoch counter accurately."""
         if os.path.exists(self.train_path):
             self.train_df = pd.read_csv(self.train_path)
 
@@ -174,6 +193,15 @@ class DirectoryTrainingLogger:
                     self.best_value = self.eval_df[self.best_metric_key].min()
             
             self.log(f"Resumed. Best {self.best_metric_key} so far: {self.best_value}")
+
+        # Restore the epoch counter so appends after a resume keep numbering
+        # forward instead of restarting at 1.
+        seen_epochs = []
+        for df in (self.train_df, self.eval_df):
+            if not df.empty and 'epoch' in df.columns:
+                seen_epochs.append(int(df['epoch'].max()))
+        if seen_epochs:
+            self._current_epoch = max(seen_epochs)
 
     def __plot_dataframe(
             self, 
@@ -233,18 +261,20 @@ class DirectoryTrainingLogger:
 
 if __name__ == "__main__":
     print("Training Logging Testing Sample - Iterative Tests")
-    
+
     # for debug
     import time
     import random
-    
-    # Initialize for a 'loss' metric (where lower is better)
-    logger = DirectoryTrainingLogger(
-        working_directory = "C:\\Users\\aditya\\Documents\\Projects\\TracedLight\\playbox_playground",
-        best_metric       = 'accuracy',
-        higher_is_better  = True,
-        experiment_name   = None
-    )
+
+    # The logger is driven by a TrainingConfiguration (lower-is-better here would
+    # need metric_to_track/higher_is_better set accordingly).
+    config = TrainingConfiguration()
+    config.working_directory = "playbox_playground"
+    config.experiment_name   = "logger_smoke_test"
+    config.metric_to_track   = "accuracy"
+    config.higher_is_better  = True
+
+    logger = DirectoryTrainingLogger(config)
 
     # Optional: Load existing data
     # logger.load_from_csv()
@@ -254,16 +284,15 @@ if __name__ == "__main__":
 
         logger.log(f"Running Epoch : {epoch}")
         train_stats = {"loss": 0.9 / epoch, "accuracy": 0.5 + (0.01 * epoch)}
-        
+
         # Run evaluation every 2nd epoch
         eval_stats = {"loss": 1.0 / epoch, "accuracy": 0.45 + (0.01 * epoch)} if epoch % 2 == 0 else None
-        
+
         logger.append(train_stats, eval_stats)
 
         if logger.is_best():
             logger.log(f"--- Epoch {epoch}: Best model detected! ---")
 
-        rdelay = random.random()
-        time.sleep(rdelay * 1.5)
+        time.sleep(random.random() * 1.5)
 
     print("Testing Finished")
