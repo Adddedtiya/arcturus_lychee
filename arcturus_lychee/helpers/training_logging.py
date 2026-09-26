@@ -6,7 +6,8 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 from typing   import Union
 
-from arcturus_lychee.configuration import TrainingConfiguration, save_config
+from arcturus_lychee.configuration             import TrainingConfiguration, save_config
+from arcturus_lychee.helpers.experiment_record import ExperimentRecord, NullRecord
 
 
 class NullLogger:
@@ -18,6 +19,7 @@ class NullLogger:
     checkpoints only on rank 0. Thus get_weights_path() returns only the file name.
     """
     run_name = ""
+    record   = NullRecord()
 
     def log(self, message : Union[str, list[str]]) -> None:  pass
     def append(self, *args, **kwargs) -> None:              pass
@@ -30,6 +32,10 @@ class DirectoryTrainingLogger:
     """Write the logs, the metrics, the plots, and the checkpoints of one run.
 
     Each run gets a run directory: <working_directory>/<run_name>/
+    The record/ subdirectory keeps the data that describes the run
+    (see ExperimentRecord). At the start, the logger writes
+    record/configuration.toml and record/code.zip.
+
     If prefix_date is True, run_name is "<date>-<experiment_name>".
     If prefix_date is False, run_name is experiment_name, and the logger uses
     the directory again if it exists. This is necessary to continue a run.
@@ -83,15 +89,20 @@ class DirectoryTrainingLogger:
 
         self.log(f"Run directory: {self.root_dir}")
 
+        # The record/ directory keeps all data that describes the run.
+        self.record = ExperimentRecord(self._create_subdir("record"))
+
         # The saved configuration also contains the run name.
         saved_configuration          = copy.copy(configuration)
         saved_configuration.run_name = run_name
-        skipped = save_config(saved_configuration, os.path.join(self.root_dir, 'configuration.toml'))
+        skipped = save_config(saved_configuration, self.record.path("configuration.toml"))
         if skipped:
             self.log(
                 "NOTE: configuration.toml does not contain these values, "
                 f"because TOML cannot hold them: {', '.join(skipped)}."
             )
+
+        self.record.save_code()
 
     @staticmethod
     def _unused_name(working_directory : str, run_name : str) -> str:

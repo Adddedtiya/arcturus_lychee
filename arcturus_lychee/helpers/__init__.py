@@ -7,6 +7,12 @@ from arcturus_lychee.helpers.training_logging import (
     NullLogger,
 )
 
+# The record/ directory of a run: configuration, code, model, and more
+from arcturus_lychee.helpers.experiment_record import (
+    ExperimentRecord,
+    NullRecord,
+)
+
 # Timer for the epochs
 from arcturus_lychee.helpers.speedster_tracker import (
     SpeedTimer

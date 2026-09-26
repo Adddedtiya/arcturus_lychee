@@ -31,6 +31,21 @@ def _is_toml_serializable(value : Any) -> bool:
     return False
 
 
+def toml_compatible(values : dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Divide a dict into the values that TOML can hold and the names of the other values.
+
+    The function returns (compatible_values, skipped_names).
+    """
+    compatible = {}
+    skipped    = []
+    for key, value in values.items():
+        if _is_toml_serializable(value):
+            compatible[key] = value
+        else:
+            skipped.append(key)
+    return compatible, skipped
+
+
 def save_config[T](config_obj : T, filepath : str) -> list[str]:
     """Write the configuration and its added attributes to a TOML file.
 
@@ -42,13 +57,7 @@ def save_config[T](config_obj : T, filepath : str) -> list[str]:
     """
     # vars() also gives the attributes that the entry script added.
     # dataclasses.asdict() gives only the fields.
-    config_dict = {}
-    skipped     = []
-    for key, value in vars(config_obj).items():
-        if _is_toml_serializable(value):
-            config_dict[key] = value
-        else:
-            skipped.append(key)
+    config_dict, skipped = toml_compatible(vars(config_obj))
 
     with open(filepath, "wb") as f:
         tomli_w.dump(config_dict, f)
