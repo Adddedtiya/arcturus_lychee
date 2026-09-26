@@ -20,6 +20,7 @@ removes the process group after the worker function stops.
 """
 
 import os
+import pickle
 import socket
 import datetime
 from typing import Callable
@@ -235,6 +236,45 @@ def _refuse_external_launcher() -> None:
     )
 
 
+def _is_picklable(value) -> bool:
+    """Return True if pickle can serialize the value."""
+    try:
+        pickle.dumps(value)
+        return True
+    except Exception:
+        return False
+
+
+def _require_picklable(worker_fn: Callable, worker_args: tuple) -> None:
+    """Stop with a clear error if the worker function or a worker argument is not compatible with pickle.
+
+    With two or more GPUs, mp.spawn uses pickle to send these items to each
+    process. This function does the same test on all paths. Thus the
+    problem shows on a single GPU too, and not only on the cluster.
+    """
+    if not _is_picklable(worker_fn):
+        raise TypeError(
+            f"The worker function '{getattr(worker_fn, '__qualname__', worker_fn)}' is not compatible with pickle. "
+            "Define the worker function at file level. "
+            "Do not use a lambda or a function inside another function."
+        )
+
+    for position, value in enumerate(worker_args):
+        if _is_picklable(value):
+            continue
+
+        attributes = vars(value) if hasattr(value, "__dict__") else {}
+        problems   = [name for name, item in attributes.items() if not _is_picklable(item)]
+        names      = ", ".join(problems) if problems else "unknown"
+
+        raise TypeError(
+            f"Worker argument {position} ({type(value).__name__}) is not compatible with pickle. "
+            f"Attributes with the problem: {names}. "
+            "mp.spawn uses pickle to send the worker arguments to each process. "
+            "Put only plain values in the configuration, for example numbers, strings, and lists."
+        )
+
+
 def _find_free_port() -> int:
     """Get an unused TCP port from the operating system.
 
@@ -312,6 +352,7 @@ def launch(
     function, after the process has its GPU.
     """
     _refuse_external_launcher()
+    _require_picklable(worker_fn, worker_args)
 
     # device_count() does not make a CUDA context. Thus the call is safe before mp.spawn.
     n_gpus = torch.cuda.device_count()
