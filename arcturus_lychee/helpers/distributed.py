@@ -23,7 +23,7 @@ import os
 import pickle
 import socket
 import datetime
-from typing import Callable
+from typing import Any, Callable
 
 import torch
 import torch.distributed as dist
@@ -133,7 +133,7 @@ def cleanup_distributed() -> None:
 # Collective reductions
 # --------------------------------------------------------------------------- #
 
-def all_reduce_sum_(tensor: torch.Tensor) -> torch.Tensor:
+def all_reduce_sum_(tensor : torch.Tensor) -> torch.Tensor:
     """Add the tensors of all ranks, in place, and return the result.
 
     After the call, each rank has the sum of all ranks. If no process group
@@ -145,7 +145,7 @@ def all_reduce_sum_(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
-def all_reduce_max(values: dict[str, float]) -> dict[str, float]:
+def all_reduce_max(values : dict[str, float]) -> dict[str, float]:
     """Return the maximum of each value across all ranks.
 
     The trainer uses this function for times, because the slowest rank sets
@@ -161,7 +161,7 @@ def all_reduce_max(values: dict[str, float]) -> dict[str, float]:
     return {k: float(payload[i].item()) for i, k in enumerate(keys)}
 
 
-def all_reduce_metric_sums(sums: dict, counts: dict) -> tuple[dict, dict]:
+def all_reduce_metric_sums(sums : dict, counts : dict) -> tuple[dict, dict]:
     """Add the weighted metric sums and the weight totals of all ranks.
 
     Old API. The current trainer uses this function. The trainer rewrite
@@ -236,7 +236,7 @@ def _refuse_external_launcher() -> None:
     )
 
 
-def _is_picklable(value) -> bool:
+def _is_picklable(value : Any) -> bool:
     """Return True if pickle can serialize the value."""
     try:
         pickle.dumps(value)
@@ -245,7 +245,7 @@ def _is_picklable(value) -> bool:
         return False
 
 
-def _require_picklable(worker_fn: Callable, worker_args: tuple) -> None:
+def _require_picklable(worker_fn : Callable, worker_args : tuple) -> None:
     """Stop with a clear error if the worker function or a worker argument is not compatible with pickle.
 
     With two or more GPUs, mp.spawn uses pickle to send these items to each
@@ -285,7 +285,7 @@ def _find_free_port() -> int:
         return s.getsockname()[1]
 
 
-def _configure_omp_threads(world_size: int) -> None:
+def _configure_omp_threads(world_size : int) -> None:
     """Divide the usable CPU cores between the processes.
 
     torchrun sets OMP_NUM_THREADS=1. Without a launcher, each of the N
@@ -324,7 +324,14 @@ def _shutdown_reusable_executors() -> None:
         pass
 
 
-def _entry(rank, world_size, backend, timeout_seconds, worker_fn, worker_args) -> None:
+def _entry(
+        rank            : int,
+        world_size      : int,
+        backend         : str,
+        timeout_seconds : int,
+        worker_fn       : Callable,
+        worker_args     : tuple,
+    ) -> None:
     """Make the process group, start the worker function, and always remove the process group at the end."""
     try:
         setup_distributed(rank, world_size, backend = backend, timeout_seconds = timeout_seconds)
