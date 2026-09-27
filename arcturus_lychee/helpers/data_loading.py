@@ -5,7 +5,7 @@ tensor, a tuple, a list, or a dict, for example 2D images, 3D volumes, or audio.
 """
 
 import time
-from typing import Any, Iterator, Union
+from typing import Any, Callable, Iterator, Optional, Union
 
 import torch
 from torch.utils.data             import DataLoader, Dataset
@@ -23,6 +23,7 @@ def build_dataloader(
         distributed   : bool = False,
         seed          : int  = 0,
         drop_last     : bool = False,
+        collate_fn    : Optional[Callable[[list], Any]] = None,
     ) -> DataLoader:
     """Make a DataLoader for a dataset of any type.
 
@@ -34,6 +35,12 @@ def build_dataloader(
     shuffle=False. Only rank 0 does the evaluation.
 
     total_workers is the number of loader workers for each process.
+
+    collate_fn makes one batch from a list of samples. Without it, PyTorch
+    stacks the samples, and all samples must have the same shape. For samples
+    with different lengths, for example audio, give a collate_fn that pads them.
+    The collate_fn must be a function at file level, so that pickle can send it
+    to the loader workers.
     """
     sampler = None
     if distributed:
@@ -62,6 +69,7 @@ def build_dataloader(
         worker_init_fn     = seed_worker if total_workers > 0 else None,
         generator          = generator,
         drop_last          = drop_last,
+        collate_fn         = collate_fn,
     )
 
 

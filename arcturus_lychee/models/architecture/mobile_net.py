@@ -27,7 +27,7 @@ class BasicMobileNetV3(nn.Module):
         return self.base(x)
 
 
-class BasicModuleNetV2(nn.Module):
+class BasicMobileNetV2(nn.Module):
     """MobileNetV2 with a new head: dropout 0.2, then 1280 -> output_classes."""
 
     def __init__(self, output_classes : int) -> None:
@@ -45,7 +45,7 @@ class BasicModuleNetV2(nn.Module):
 
 if __name__ == "__main__":
     # Demo: one forward pass. The first start downloads the ImageNet weights.
-    model = BasicModuleNetV2(100)
+    model = BasicMobileNetV2(100)
     x     = torch.rand(1, 3, 224, 224)
     y     = model(x)
     print(f"Output shape: {tuple(y.shape)}")

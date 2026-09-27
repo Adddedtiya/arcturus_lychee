@@ -11,5 +11,5 @@ from arcturus_lychee.models.architecture.efficient_net_v2 import (
 # MobileNet with a new classifier head (pretrained on ImageNet)
 from arcturus_lychee.models.architecture.mobile_net import (
     BasicMobileNetV3,
-    BasicModuleNetV2,
+    BasicMobileNetV2,
 )
