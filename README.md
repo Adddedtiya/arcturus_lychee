@@ -27,7 +27,7 @@ The template has no command-line options and no configuration files to write. Al
 - **Plain Python start.** You start each training with `python main.py`. The template does not use torchrun or `python -m`. The same command works in SLURM, Singularity, Docker, and a shell.
 - **One code path.** With one GPU, the training operates in one process without DDP. With two or more GPUs, the template starts one process for each GPU. The trainer code is the same in both cases.
 - **Configuration in Python.** A dataclass holds the values. `build_config()` in the entry script changes them.
-- **Everything is recorded.** Each run directory has a `record/` directory with the configuration, a zip file of the code, the environment, the model, the optimizer, and a summary.
+- **Everything is recorded.** Each run directory has a `record/` directory. It holds the configuration, a zip file of the code, the environment, the model, the optimizer, and a summary.
 - **Readable classes.** A trainer is one explicit class. All state is on `self`. The template has no hidden framework and no hooks.
 - **Shared code does not know the task.** The shared tools work with images, volumes, audio, and other data.
 
@@ -70,7 +70,7 @@ CUDA_VISIBLE_DEVICES=0,1 python main.py
 
 `batch_size` is the batch for each GPU. The global batch is `batch_size` x the number of GPUs.
 
-CAUTION: Do not start the script with torchrun, or with `srun` and more than one task. The script then stops with an error. Each external process can start one process for each GPU, and the GPUs get too many processes.
+Do not start the script with torchrun, or with `srun` and more than one task. The script then stops with an error. Without this error, each external process starts one process for each GPU, and the GPUs get too many processes.
 
 To debug with breakpoints, use one GPU. The training then operates in one process:
 
@@ -211,15 +211,14 @@ configuration = load_run_configuration("results/2026_09_26_10_00-baseline")
 configuration.prefix_date     = False
 configuration.experiment_name = configuration.run_name
 
-# in worker():
+# in worker(). All ranks load latest.pt, so the path comes from the configuration.
+latest     = os.path.join(configuration.working_directory, configuration.run_name, "weights", "latest.pt")
 logger     = DirectoryTrainingLogger(configuration) if is_main_process() else NullLogger()
 trainer    = ClassificationTrainer(model, configuration, logger)
-last_epoch = trainer.load_state(logger.get_weights_path("latest.pt"))
+last_epoch = trainer.load_state(latest)
 logger.load_from_csv()
 trainer.fit(train_loader, eval_loader, start_epoch = last_epoch + 1)
 ```
-
-Note: on ranks other than rank 0, `get_weights_path()` returns only the file name. To continue a DDP run, give the full path of `latest.pt` to `load_state()` on all ranks.
 
 ## 9. Read the timing columns
 
@@ -454,6 +453,8 @@ self.optimizer.zero_grad(set_to_none = True)
 Gradient accumulation. Keep a step counter in `__init__()`, for example `self.micro_step = 0`. With DDP, use `no_sync()` for the steps without an optimizer step:
 
 ```python
+import contextlib
+
 self.micro_step += 1
 is_update = self.micro_step % self.configuration.accumulation_steps == 0
 context   = contextlib.nullcontext() if is_update or self.world_size == 1 else self.model.no_sync()

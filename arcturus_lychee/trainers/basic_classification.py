@@ -365,13 +365,17 @@ class ClassificationTrainer:
 
         Each rank can call this method. Each rank loads the data to its own device.
 
-        To continue a run:
+        To continue a run (README section 8). All ranks load the checkpoint, so
+        the path comes from the configuration, not from the logger:
 
+            configuration = load_run_configuration("<run directory>")
             configuration.prefix_date     = False
-            configuration.experiment_name = "<run name of the previous run>"
-            logger     = DirectoryTrainingLogger(configuration)
+            configuration.experiment_name = configuration.run_name
+
+            latest     = os.path.join(configuration.working_directory, configuration.run_name, "weights", "latest.pt")
+            logger     = DirectoryTrainingLogger(configuration) if is_main_process() else NullLogger()
             trainer    = ClassificationTrainer(model, configuration, logger)
-            last_epoch = trainer.load_state(logger.get_weights_path("latest.pt"))
+            last_epoch = trainer.load_state(latest)
             logger.load_from_csv()
             trainer.fit(train_loader, eval_loader, start_epoch = last_epoch + 1)
         """
