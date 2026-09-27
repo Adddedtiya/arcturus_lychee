@@ -1,34 +1,25 @@
 import os
 
-# Valid Image Extensions
-IMG_EXTENSIONS = [
-    '.jpg', '.JPG', '.jpeg', '.JPEG',
-    '.png', '.PNG', 
-    '.ppm', '.PPM', 
-    '.bmp', '.BMP',
-    '.tif', '.TIF', 
-    '.tiff', '.TIFF',
-]
+
+# The file extensions of image files. The comparison ignores uppercase and lowercase.
+IMG_EXTENSIONS : set[str] = {'.jpg', '.jpeg', '.png', '.ppm', '.bmp', '.tif', '.tiff'}
+
 
 def _is_ext_image_file(filename : str) -> bool:
-    return any(filename.endswith(extension) for extension in IMG_EXTENSIONS)
+    """Return True if the file name has an image extension."""
+    return os.path.splitext(filename)[1].lower() in IMG_EXTENSIONS
+
 
 def scan_directory_for_images(root_dir : str) -> list[str]:
-    
-    # store the files here !
+    """Return the sorted absolute paths of all image files in root_dir and its subdirectories."""
+    if not os.path.isdir(root_dir):
+        raise NotADirectoryError(f'The path "{root_dir}" is not a directory.')
+
     image_files = []
+    for root, _, file_names in os.walk(root_dir):
+        for file_name in file_names:
+            if _is_ext_image_file(file_name):
+                image_files.append(os.path.abspath(os.path.join(root, file_name)))
 
-    # sanity check
-    assert os.path.isdir(root_dir), f'The Path "{root_dir}" is not a valid directory'
-
-    # scan the directories
-    for root, _, fnames in os.walk(root_dir):
-        for fname in fnames:
-            if _is_ext_image_file(fname):
-                fpath = os.path.join(root, fname)
-                fpath = os.path.abspath(fpath)
-                image_files.append(fpath)
-    
-    # sort the directory and return
     image_files.sort()
     return image_files
