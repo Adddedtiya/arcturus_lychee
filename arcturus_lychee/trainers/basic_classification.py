@@ -1,48 +1,88 @@
+"""The training loop for image classification. This file is the worked example.
+
+For a new project, copy this file. Then change train_step(), eval_step(),
+and report(). The other methods usually stay the same.
+
+Rules for this file:
+
+  - Settings go in the configuration. Read them with self.configuration.
+  - State goes on self. Make all state in __init__.
+  - Do not put variables at file level. Each process imports this file again,
+    so a change to a file-level variable does not get to the other processes.
+
+Under DDP (two or more GPUs), DistributedDataParallel synchronizes the
+gradients in each backward pass. Rank 0 does the evaluation, the logs, and
+the checkpoints. The training metrics include all ranks. With one GPU, the
+same code operates without a process group.
+"""
+
 import torch
-import torch.nn             as nn
+import torch.nn as nn
 
-from torch.optim                  import AdamW
-from torch.optim.lr_scheduler     import CosineAnnealingLR
-from torch.amp.grad_scaler        import GradScaler
-from torch.utils.data             import DataLoader
-from torch.utils.data.distributed import DistributedSampler
-from torch.nn.parallel            import DistributedDataParallel as DDP
+from torch.optim              import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data         import DataLoader
+from tqdm                     import tqdm
+from typing                   import Optional, Union
 
+from arcturus_lychee.configuration import TrainingConfiguration, toml_compatible
 from arcturus_lychee.helpers import (
     DirectoryTrainingLogger,
     NullLogger,
     SpeedTimer,
-    generate_report,
-    generate_confusion_matrix,
-)
-from arcturus_lychee.helpers.distributed import (
+    MetricAccumulator,
+    TimedLoader,
+    Precision,
+    wrap_model,
+    unwrap_model,
+    move_to_device,
+    set_sampler_epoch,
+    get_device,
     get_world_size,
     is_main_process,
     barrier,
-    all_reduce_metric_sums,
+    all_reduce_sum_,
+    all_reduce_max,
+    generate_report,
+    generate_confusion_matrix,
 )
-from arcturus_lychee.configuration.basic_template import TrainingConfiguration
-
-from collections import defaultdict
-from tqdm        import tqdm
-from typing      import Union
 
 
-class WrapperForClassification:
-    """Classification training loop with transparent single-/multi-GPU support.
+def top_k_accuracy(
+        prediction : torch.Tensor,
+        target     : torch.Tensor,
+        ks         : tuple[int, ...],
+    ) -> dict[str, torch.Tensor]:
+    """Return the top-k accuracy for each k, as tensors on the device.
 
-    Under DDP (``world_size > 1``) the model is wrapped in
-    ``DistributedDataParallel`` and gradients are synchronised every backward
-    pass. Everything that is not a training collective - evaluation, the sklearn
-    report, checkpointing and all disk logging - runs on rank 0 only. The
-    training-metric averages are all-reduced so the logged curves reflect the
-    whole dataset rather than rank 0's shard.
+    A value of k that is more than the number of classes is not in the result.
+    """
+    ks = tuple(k for k in ks if k <= prediction.size(1))
+    if not ks:
+        return {}
 
-    When ``world_size == 1`` no process group exists, every distributed helper
-    no-ops, and the behaviour is identical to the original single-GPU trainer.
+    _, predicted = prediction.topk(max(ks), dim = 1)      # [batch, max_k]
+    correct      = predicted.eq(target.view(-1, 1))       # [batch, max_k]
+    return {f"top-{k}": correct[:, :k].any(dim = 1).float().mean() for k in ks}
 
-    The configuration is passed in directly (rather than read off the logger),
-    because every rank needs the config but only rank 0 owns a real logger.
+
+def format_metrics(metrics : dict[str, float]) -> str:
+    """Return the metrics as one line of text, for example "loss 0.4123, top-1 0.8125"."""
+    return ", ".join(f"{name} {value:.4g}" for name, value in metrics.items())
+
+
+class ClassificationTrainer:
+    """Train, evaluate, and save an image classification model.
+
+    Edit these methods for a new project:
+
+      - train_step: one training batch
+      - eval_step: one evaluation batch
+      - report: the output at the end of the training
+
+    These methods usually stay the same:
+
+      - train_epoch, evaluate, fit, save_state, load_state
     """
 
     def __init__(
@@ -50,385 +90,298 @@ class WrapperForClassification:
             model         : nn.Module,
             configuration : TrainingConfiguration,
             logger        : Union[DirectoryTrainingLogger, NullLogger, None] = None,
-        ):
+        ) -> None:
 
-        # config + logger (logger is None / NullLogger on non-main ranks)
         self.configuration = configuration
         self.log           = logger if logger is not None else NullLogger()
 
-        # distributed context
+        # processes and device
         self.world_size = get_world_size()
         self.is_main    = is_main_process()
+        self.device     = get_device()
 
-        # Per-rank device. Under DDP each rank owns exactly one GPU; use the
-        # device the process group pinned. `.type` (not str(device)) is used for
-        # autocast / GradScaler so an indexed device like cuda:1 works correctly.
-        if torch.cuda.is_available() and self.world_size > 1:
-            self.device = torch.device("cuda", torch.cuda.current_device())
-        else:
-            self.device = configuration.device
-
-        # dtype is resolved lazily here (inside the worker), never in the parent
-        self.data_type = configuration.resolved_dtype()
-
-        # epochs
         self.total_epochs = configuration.total_epochs
 
-        # ---- model placement, optional SyncBN, optional DDP wrap ----
-        model = model.to(self.device)
+        # model: self.model can have a DDP wrapper. self.raw_model never has one.
+        self.model = wrap_model(
+            model,
+            self.device,
+            sync_batchnorm         = configuration.use_sync_batchnorm,
+            find_unused_parameters = configuration.find_unused_parameters,
+        )
+        self.raw_model = unwrap_model(self.model)
 
-        if self.world_size > 1 and configuration.use_sync_batchnorm:
-            # fuse BatchNorm stats across GPUs - useful when the per-GPU batch is
-            # small (must happen before the DDP wrap)
-            model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
-
-        if self.world_size > 1:
-            device_ids = [self.device.index] if self.device.type == "cuda" else None
-            self.model = DDP(
-                model,
-                device_ids            = device_ids,
-                output_device         = self.device.index if self.device.type == "cuda" else None,
-                find_unused_parameters = configuration.find_unused_parameters,
-            )
-        else:
-            self.model = model
-
-        # unwrapped reference: used for eval/test forward and for checkpoints so
-        # saved state_dicts have no "module." prefix and stay single-GPU loadable
-        self.raw_model = self.model.module if isinstance(self.model, DDP) else self.model
-
-        # ---- optimizer (with optional linear LR scaling) ----
+        # optimizer and scheduler
         learning_rate = configuration.learning_rate
         if configuration.scale_lr_by_world_size and self.world_size > 1:
             scaled = learning_rate * self.world_size
-            self.log.print(f"[DDP] Scaling LR by world_size={self.world_size}: {learning_rate} -> {scaled}")
+            self.log.log(
+                f"The trainer multiplies the learning rate by the number of GPUs "
+                f"({self.world_size}): {learning_rate} -> {scaled}"
+            )
             learning_rate = scaled
 
         self.optimizer = AdamW(self.model.parameters(), lr = learning_rate)
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max = self.total_epochs)
-
-        # loss
         self.criterion = nn.CrossEntropyLoss()
+        self.precision = Precision(configuration.precision, self.device)
 
-        # AMP: autocast on CUDA; GradScaler only for true fp16 (bf16/fp32 skip it)
-        self.use_amp         = self.device.type == "cuda"
-        self.use_grad_scaler = self.data_type == torch.float16
-        self.gradient_scaler = GradScaler(self.device.type, enabled = self.use_grad_scaler)
+        self.log.log(f"Device: {self.device}. Precision: {self.precision.name}. Processes: {self.world_size}.")
+
+        # the record of the run
+        self.log.record.save_model(self.raw_model)
+        skipped = self.log.record.save_optimizer(self.optimizer, self.scheduler)
+        if skipped:
+            self.log.log(f"NOTE: optimizer.toml does not contain these values: {', '.join(skipped)}.")
 
     # ----------------------------------------------------------------------- #
-    # Checkpointing
+    # Edit these methods for a new project
+    # ----------------------------------------------------------------------- #
+
+    def train_step(self, batch : tuple[torch.Tensor, torch.Tensor]) -> tuple[dict[str, torch.Tensor], int]:
+        """Train on one batch. Return the metrics and the number of samples in the batch."""
+        images, labels = move_to_device(batch, self.device)
+
+        with self.precision.autocast():
+            prediction = self.model(images)
+            loss       = self.criterion(prediction, labels)
+
+        self.precision.backward(loss)
+        self.precision.step(self.optimizer)
+        self.optimizer.zero_grad(set_to_none = True)
+
+        metrics = {"loss": loss.detach()}
+        metrics.update(top_k_accuracy(prediction.detach(), labels, ks = (1, 5)))
+        return metrics, images.size(0)
+
+    @torch.no_grad()
+    def eval_step(self, batch : tuple[torch.Tensor, torch.Tensor]) -> tuple[dict[str, torch.Tensor], int]:
+        """Evaluate one batch. Return the metrics and the number of samples in the batch."""
+        images, labels = move_to_device(batch, self.device)
+
+        with self.precision.autocast():
+            prediction = self.raw_model(images)
+            loss       = self.criterion(prediction, labels)
+
+        metrics = {"loss": loss}
+        metrics.update(top_k_accuracy(prediction, labels, ks = (1, 5)))
+        return metrics, images.size(0)
+
+    @torch.no_grad()
+    def report(
+            self,
+            loader      : DataLoader,
+            title       : str,
+            class_names : Optional[list[str]] = None,
+        ) -> dict[str, float]:
+        """Write the accuracy, the classification report, and the confusion matrix.
+
+        The text goes to the log and to record/report_<title>.txt.
+        Only rank 0 makes the report. The other ranks return an empty dict.
+        """
+        if not self.is_main:
+            return {}
+
+        self.raw_model.eval()
+        meter     = MetricAccumulator()
+        truth     : list[int] = []
+        predicted : list[int] = []
+
+        for batch in tqdm(loader, desc = f"Report {title}"):
+            images, labels = move_to_device(batch, self.device)
+            with self.precision.autocast():
+                prediction = self.raw_model(images)
+
+            for name, value in top_k_accuracy(prediction, labels, ks = (1, 3, 5)).items():
+                meter.add(name, value, weight = images.size(0))
+            truth     += labels.tolist()
+            predicted += prediction.argmax(dim = 1).tolist()
+
+        accuracy = meter.reduce(across_ranks = False)
+
+        lines  = [f"Report: {title}", ""]
+        lines += [f"Accuracy {name} : {value:.4f}" for name, value in accuracy.items()]
+        lines += ["", "Classification report:"]
+        lines += generate_report(truth, predicted, class_names)
+        lines += ["", "Confusion matrix:"]
+        lines += generate_confusion_matrix(truth, predicted, class_names)
+
+        self.log.log(lines)
+        self.log.record.save_text(f"report_{title.lower().replace(' ', '_')}.txt", lines)
+        return accuracy
+
+    # ----------------------------------------------------------------------- #
+    # These methods usually stay the same
+    # ----------------------------------------------------------------------- #
+
+    def train_epoch(self, loader : DataLoader, epoch : int) -> dict[str, float]:
+        """Train for one epoch. Return the mean metrics of all ranks and the times.
+
+        All ranks must call this method. It uses collective operations.
+        """
+        self.model.train()
+        set_sampler_epoch(loader, epoch)
+
+        timer   = SpeedTimer()
+        timed   = TimedLoader(loader, sync_cuda = self.configuration.time_with_cuda_sync)
+        meter   = MetricAccumulator()
+        samples = 0
+
+        for batch in tqdm(timed, desc = "Train", disable = not self.is_main):
+            metrics, batch_samples = self.train_step(batch)
+            for name, value in metrics.items():
+                meter.add(name, value, weight = batch_samples)
+            samples += batch_samples
+
+        stats = meter.reduce(across_ranks = True)
+
+        # The slowest rank sets the time. The samples of all ranks add together.
+        times         = all_reduce_max({**timed.stats(), "time_train_s": timer.stop()})
+        total_samples = all_reduce_sum_(torch.tensor(float(samples), device = self.device)).item()
+
+        stats.update(times)
+        stats["samples_per_s"] = total_samples / times["time_train_s"] if times["time_train_s"] > 0 else 0.0
+        return stats
+
+    def evaluate(self, loader : DataLoader) -> dict[str, float]:
+        """Evaluate on rank 0 only. Return the mean metrics.
+
+        The method does not use collective operations. Thus the other ranks can
+        wait at the barrier in fit().
+        """
+        self.raw_model.eval()
+        meter = MetricAccumulator()
+
+        for batch in tqdm(loader, desc = "Evaluation", disable = not self.is_main):
+            metrics, batch_samples = self.eval_step(batch)
+            for name, value in metrics.items():
+                meter.add(name, value, weight = batch_samples)
+
+        return meter.reduce(across_ranks = False)
+
+    def fit(
+            self,
+            train_loader : DataLoader,
+            eval_loader  : Optional[DataLoader],
+            start_epoch  : int = 0,
+        ) -> None:
+        """Train for all epochs. Evaluate, log, and save checkpoints on rank 0.
+
+        Evaluation: after each test_every_n epochs, and after the last epoch.
+        latest.pt: after each save_every_n epochs, and after the last epoch.
+        best.pt: after each evaluation with a new best value.
+        final.pt and record/summary.toml: at the end.
+
+        To continue a run, see load_state().
+        """
+        configuration = self.configuration
+        total_timer   = SpeedTimer()
+        train_stats   : dict[str, float]           = {}
+        last_eval     : Optional[dict[str, float]] = None
+
+        self.log.log("The training starts.")
+
+        for epoch in range(start_epoch, self.total_epochs):
+            epoch_timer = SpeedTimer()
+            is_last     = epoch == self.total_epochs - 1
+            self.log.log(f"Epoch {epoch + 1} of {self.total_epochs}")
+
+            # all ranks: train, then change the learning rate
+            train_stats       = self.train_epoch(train_loader, epoch)
+            train_stats["lr"] = float(sum(self.scheduler.get_last_lr()) / len(self.scheduler.get_last_lr()))
+            self.scheduler.step()
+
+            # rank 0: evaluate
+            eval_stats  = None
+            should_eval = (epoch + 1) % configuration.test_every_n == 0 or is_last
+            if self.is_main and eval_loader is not None and should_eval:
+                eval_timer = SpeedTimer()
+                eval_stats = self.evaluate(eval_loader)
+                last_eval  = eval_stats
+                train_stats["time_eval_s"] = eval_timer.stop()
+            else:
+                train_stats["time_eval_s"] = 0.0
+
+            # rank 0: logs and checkpoints
+            if self.is_main:
+                train_stats["time_epoch_s"] = epoch_timer.elapsed()
+                self.log.append(train_stats, eval_stats, epoch = epoch + 1)
+
+                self.log.log(f"Train: {format_metrics(train_stats)}")
+                if eval_stats is not None:
+                    self.log.log(f"Evaluation: {format_metrics(eval_stats)}")
+
+                if self.log.is_best():
+                    self.log.log(f"New best {configuration.metric_to_track}: {self.log.best_value:.4f}. The trainer saves best.pt.")
+                    self.save_state(self.log.get_weights_path("best.pt"), epoch = epoch)
+
+                if (epoch + 1) % configuration.save_every_n == 0 or is_last:
+                    self.save_state(self.log.get_weights_path("latest.pt"), epoch = epoch)
+
+                self.log.log(SpeedTimer.estimate_time(epoch_timer, self.total_epochs - epoch - 1))
+
+            # All ranks wait here. Rank 0 can need more time for the evaluation and the checkpoints.
+            barrier()
+
+        if self.is_main:
+            self.save_state(self.log.get_weights_path("final.pt"), epoch = self.total_epochs - 1)
+            self.log.record.save_toml("summary.toml", {
+                "run_name"     : self.log.run_name,
+                "total_epochs" : self.total_epochs,
+                "total_time_s" : total_timer.stop(),
+                "best"         : {
+                    "metric" : configuration.metric_to_track,
+                    "value"  : self.log.best_value,
+                    "epoch"  : self.log.best_epoch,
+                },
+                "last_train"   : train_stats,
+                "last_eval"    : last_eval or {},
+            })
+
+        self.log.log("The training is complete.")
+
+    # ----------------------------------------------------------------------- #
+    # Checkpoints
     # ----------------------------------------------------------------------- #
 
     def save_state(self, fpath : str, epoch : int = 0) -> None:
-        # save the UNWRAPPED model so checkpoints load with or without DDP
+        """Save a checkpoint. The model has no DDP wrapper, so the file loads with and without DDP.
+
+        The checkpoint also contains the configuration, as a dict of plain values.
+        """
+        configuration, _ = toml_compatible(vars(self.configuration))
         state = {
             'epoch'           : int(epoch),
             'model_state'     : self.raw_model.state_dict(),
             'optimizer_state' : self.optimizer.state_dict(),
             'scheduler_state' : self.scheduler.state_dict(),
-            'scaler_state'    : self.gradient_scaler.state_dict(),
+            'scaler_state'    : self.precision.state_dict(),
+            'configuration'   : configuration,
         }
         torch.save(state, fpath)
 
     def load_state(self, fpath : str) -> int:
-        """Restore model / optimizer / scheduler / scaler and return the saved epoch.
+        """Load a checkpoint, and return its epoch index (the first epoch is 0).
 
-        Safe to call on every rank when resuming: each maps the checkpoint onto
-        its own device.
+        Each rank can call this method. Each rank loads the data to its own device.
 
-        To resume training:
-            last_epoch = wrapper.load_state(logger.get_weights_path("latest.pt"))
-            logger.load_from_csv()                      # restore metric history + best value + epoch
-            wrapper.run_everything(..., start_epoch = last_epoch + 1)
+        To continue a run:
+
+            configuration.prefix_date     = False
+            configuration.experiment_name = "<run name of the previous run>"
+            logger     = DirectoryTrainingLogger(configuration)
+            trainer    = ClassificationTrainer(model, configuration, logger)
+            last_epoch = trainer.load_state(logger.get_weights_path("latest.pt"))
+            logger.load_from_csv()
+            trainer.fit(train_loader, eval_loader, start_epoch = last_epoch + 1)
         """
         state = torch.load(fpath, map_location = self.device, weights_only = True)
 
         self.raw_model.load_state_dict(state['model_state'], strict = True)
         self.optimizer.load_state_dict(state['optimizer_state'])
-        self.gradient_scaler.load_state_dict(state['scaler_state'])
+        self.precision.load_state_dict(state['scaler_state'])
 
         if state.get('scheduler_state') is not None:
             self.scheduler.load_state_dict(state['scheduler_state'])
 
         return int(state.get('epoch', 0))
-
-    # ----------------------------------------------------------------------- #
-    # Metrics
-    # ----------------------------------------------------------------------- #
-
-    def __compute_top_n(self, x_real : torch.Tensor, y_pred : torch.Tensor, top_k : tuple[int, ...] = (1, 5)) -> dict[str, float]:
-
-        y_pred = y_pred.detach()
-        results = {}
-
-        with torch.no_grad():
-            # clamp k to the number of classes so e.g. top-5 on a few-class model
-            # doesn't raise "selected index k out of range"
-            num_classes = y_pred.size(1)
-            top_k = tuple(k for k in top_k if k <= num_classes)
-            if not top_k:
-                return results
-
-            max_k      = max(top_k)
-            batch_size = x_real.size(0)
-
-            _, pred = y_pred.topk(max_k, 1, True, True)
-            pred = pred.t()
-            correct = pred.eq(x_real.view(1, -1).expand_as(pred))
-
-            for k in top_k:
-                correct_k = correct[:k].reshape(-1).float().sum(0, keepdim = True)
-                results[f"top-{k}"] = float(correct_k.item() / batch_size)
-
-        return results
-
-    def __compute_metrics(self, x_real : torch.Tensor, y_pred : torch.Tensor) -> dict[str, float]:
-        return self.__compute_top_n(x_real, y_pred, top_k = (1, 5))
-
-    def __calculate_metric_averages(
-            self,
-            metrics             : list[dict[str, float]],
-            weights             : Union[list[float], None] = None,
-            reduce_across_ranks : bool = False,
-        ) -> dict[str, float]:
-
-        if not metrics and not reduce_across_ranks:
-            return {}
-
-        if weights is None:
-            weights = [1.0] * len(metrics)
-
-        weighted_sum  = defaultdict(float)
-        weight_totals = defaultdict(float)
-        for item, weight in zip(metrics, weights):
-            for key, value in item.items():
-                weighted_sum[key]  += value * weight
-                weight_totals[key] += weight
-
-        # sum the per-rank totals so the mean is over the whole dataset, not one shard
-        if reduce_across_ranks:
-            weighted_sum, weight_totals = all_reduce_metric_sums(dict(weighted_sum), dict(weight_totals))
-
-        return {
-            key: float(weighted_sum[key] / weight_totals[key])
-            for key in weighted_sum
-            if weight_totals.get(key, 0.0) != 0.0
-        }
-
-    # ----------------------------------------------------------------------- #
-    # Single-batch steps
-    # ----------------------------------------------------------------------- #
-
-    def __train_single_batch(self, input_tensor : torch.Tensor, target_tensor : torch.Tensor) -> dict[str, float]:
-
-        self.model.train()
-
-        with torch.autocast(device_type = self.device.type, dtype = self.data_type, enabled = self.use_amp):
-            input_tensor  = input_tensor.to(self.device)
-            target_tensor = target_tensor.to(self.device)
-
-            prediction : torch.Tensor = self.model(input_tensor)
-            loss : torch.Tensor = self.criterion(prediction, target_tensor)
-
-        scaled_loss = self.gradient_scaler.scale(loss)
-        scaled_loss.backward()
-
-        self.gradient_scaler.step(self.optimizer)
-        self.gradient_scaler.update()
-        self.optimizer.zero_grad(set_to_none = True)
-
-        metrics = self.__compute_metrics(target_tensor, prediction)
-        metrics['loss'] = float(loss.item())
-        return metrics
-
-    def __test_single_batch(self, input_tensor : torch.Tensor, target_tensor : torch.Tensor) -> dict[str, float]:
-
-        # eval uses the unwrapped model - no gradient sync, safe to run on rank 0 alone
-        self.raw_model.eval()
-
-        with torch.autocast(device_type = self.device.type, dtype = self.data_type, enabled = self.use_amp), torch.no_grad():
-            input_tensor  = input_tensor.to(self.device)
-            target_tensor = target_tensor.to(self.device)
-
-            prediction : torch.Tensor = self.raw_model(input_tensor)
-            metrics = self.__compute_metrics(target_tensor, prediction)
-
-        return metrics
-
-    # ----------------------------------------------------------------------- #
-    # Epoch loops
-    # ----------------------------------------------------------------------- #
-
-    def _set_train_sampler_epoch(self, dataloader : DataLoader, epoch : int) -> None:
-        # DistributedSampler needs set_epoch() each epoch or the shuffle is frozen
-        sampler = getattr(dataloader, "sampler", None)
-        if isinstance(sampler, DistributedSampler):
-            sampler.set_epoch(epoch)
-
-    def train_single_epoch(self, dataloader : DataLoader, enable_tqdm : bool = True) -> dict[str, float]:
-
-        active_metrics = []
-        batch_sizes    = []
-        self.model.train()
-
-        for _, (input_tensor, target_tensor) in enumerate(tqdm(dataloader, disable = not (enable_tqdm and self.is_main))):
-            batch_metrics = self.__train_single_batch(input_tensor, target_tensor)
-            active_metrics.append(batch_metrics)
-            batch_sizes.append(input_tensor.size(0))
-
-        # every rank participates in the reduction (a collective) so the logged
-        # training numbers are the true epoch-wide mean
-        return self.__calculate_metric_averages(
-            active_metrics, batch_sizes, reduce_across_ranks = self.world_size > 1
-        )
-
-    def test_single_epoch(self, dataloader : DataLoader, enable_tqdm : bool = True) -> dict[str, float]:
-
-        active_metrics = []
-        batch_sizes    = []
-        self.raw_model.eval()
-
-        for _, (input_tensor, target_tensor) in enumerate(tqdm(dataloader, disable = not enable_tqdm)):
-            batch_metrics = self.__test_single_batch(input_tensor, target_tensor)
-            active_metrics.append(batch_metrics)
-            batch_sizes.append(input_tensor.size(0))
-
-        # rank-0-only: no cross-rank reduction (avoids DistributedSampler padding
-        # double-counting) - see run_single_epoch
-        return self.__calculate_metric_averages(active_metrics, batch_sizes)
-
-    def __get_current_learning_rate(self) -> float:
-        current_rates = [float(x) for x in self.scheduler.get_last_lr()]
-        return float(sum(current_rates) / len(current_rates))
-
-    def run_single_epoch(
-            self,
-            train_dataloader : DataLoader,
-            test_dataloader  : Union[DataLoader, None],
-            current_epoch    : int,
-            enable_tqdm      : bool = True,
-            test_every       : int  = 1,
-        ) -> tuple[dict[str, float], Union[dict[str, float], None], SpeedTimer]:
-
-        total_runtime = SpeedTimer()
-
-        # reshuffle this rank's shard for the epoch, then train (all ranks)
-        self._set_train_sampler_epoch(train_dataloader, current_epoch)
-        train_stats = self.train_single_epoch(train_dataloader, enable_tqdm)
-
-        # evaluation is rank-0 only (keeps the sklearn path exact, no padding dupes)
-        test_stats = None
-        should_test = (current_epoch % test_every) == 0 or (current_epoch == 0)
-        if self.is_main and test_dataloader is not None and should_test:
-            test_stats = self.test_single_epoch(test_dataloader, enable_tqdm)
-
-        # log the LR that was active this epoch, then step (all ranks step in lockstep)
-        train_stats['lr'] = self.__get_current_learning_rate()
-        self.scheduler.step()
-
-        total_runtime.stop()
-        return train_stats, test_stats, total_runtime
-
-    def run_everything(
-            self,
-            train_dataloader : DataLoader,
-            test_dataloader  : Union[DataLoader, None],
-            enable_tqdm      : bool = True,
-            test_every       : int  = 1,
-            start_epoch      : int  = 0,
-            save_every       : int  = 1,
-        ) -> None:
-
-        self.log.print("Starting Training !")
-
-        for current_epoch in range(start_epoch, self.total_epochs):
-
-            self.log.print(f"Current Epoch : {current_epoch + 1}")
-
-            train_stats, eval_stats, total_runtime = self.run_single_epoch(
-                train_dataloader = train_dataloader,
-                test_dataloader  = test_dataloader,
-                current_epoch    = current_epoch,
-                enable_tqdm      = enable_tqdm,
-                test_every       = test_every,
-            )
-
-            # logging / best-model / periodic saves: rank 0 only
-            if self.is_main:
-                self.log.append(train_stats, eval_stats)
-
-                if self.log.is_best():
-                    self.log.print("--- Best model detected! ---")
-                    self.save_state(self.log.get_weights_path('best.pt'), epoch = current_epoch)
-
-                if (current_epoch % save_every) == 0 or (current_epoch == 0):
-                    self.save_state(self.log.get_weights_path("latest.pt"), epoch = current_epoch)
-
-                leftover_epochs = self.total_epochs - current_epoch
-                self.log.print(SpeedTimer.estimate_time(total_runtime, leftover_epochs))
-
-            # keep ranks in lockstep each epoch: rank 0 may have spent extra time
-            # on eval / checkpointing while the others waited here
-            barrier()
-
-        # final checkpoint: rank 0 only
-        if self.is_main:
-            self.save_state(self.log.get_weights_path("final.pt"), epoch = self.total_epochs - 1)
-
-        self.log.print("Training is Complete !")
-
-    # ----------------------------------------------------------------------- #
-    # Standalone test / report (rank 0 only)
-    # ----------------------------------------------------------------------- #
-
-    def test_model(
-            self,
-            test_dataloader  : DataLoader,
-            report_prefix    : str                    = "",
-            enable_tqdm      : bool                   = True,
-            class_names      : Union[list[str], None] = None,
-        ) -> None:
-
-        # no collectives here; run only on rank 0
-        if not self.is_main:
-            return
-
-        predicted_results   : list[int] = []
-        ground_truth_values : list[int] = []
-        accuracy_reports    : list[dict[str, float]] = []
-        batch_sizes         : list[float]            = []
-
-        self.log.print("")
-        self.log.print(f"Testing For : {report_prefix}")
-
-        self.raw_model.eval()
-        for _, (input_tensor, target_tensor) in enumerate(tqdm(test_dataloader, disable = not enable_tqdm)):
-
-            with torch.autocast(device_type = self.device.type, dtype = self.data_type, enabled = self.use_amp), torch.no_grad():
-                input_tensor  = input_tensor.to(self.device)
-                target_tensor = target_tensor.to(self.device)
-
-                prediction : torch.Tensor = self.raw_model(input_tensor)
-
-                top_k_values = self.__compute_top_n(target_tensor, prediction, top_k = (1, 3, 5))
-                accuracy_reports.append(top_k_values)
-                batch_sizes.append(input_tensor.size(0))
-
-            ground_truth_values += target_tensor.detach().cpu().tolist()
-            preds = torch.argmax(prediction, dim = 1)
-            predicted_results += preds.detach().cpu().tolist()
-
-        average_top_k = self.__calculate_metric_averages(accuracy_reports, batch_sizes)
-        for top_k in average_top_k.keys():
-            self.log.print(f"Accuracy in {top_k} : {average_top_k[top_k]:.2f}")
-        self.log.print("")
-
-        self.log.print("Report :")
-        report_lines = generate_report(ground_truth_values, predicted_results, class_names)
-        self.log.print_lines(report_lines)
-        self.log.print("")
-
-        self.log.print("Confusion Matrix :")
-        confusion_lines = generate_confusion_matrix(ground_truth_values, predicted_results, class_names)
-        self.log.print_lines(confusion_lines)
-        self.log.print("")

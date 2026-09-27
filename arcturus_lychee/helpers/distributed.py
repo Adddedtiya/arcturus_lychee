@@ -155,37 +155,12 @@ def all_reduce_max(values : dict[str, float]) -> dict[str, float]:
     if not is_dist_initialized() or not values:
         return dict(values)
 
+    # All ranks must use the same key order in the tensor. The result keeps the order of the input.
     keys    = sorted(values.keys())
     payload = torch.tensor([values[k] for k in keys], dtype = torch.float64, device = get_device())
     dist.all_reduce(payload, op = dist.ReduceOp.MAX)
-    return {k: float(payload[i].item()) for i, k in enumerate(keys)}
-
-
-def all_reduce_metric_sums(sums : dict, counts : dict) -> tuple[dict, dict]:
-    """Add the weighted metric sums and the weight totals of all ranks.
-
-    Old API. The current trainer uses this function. The trainer rewrite
-    replaces it with MetricAccumulator, and then removes this function.
-    All ranks must give the same keys.
-    """
-    if not is_dist_initialized():
-        return sums, counts
-
-    keys = sorted(sums.keys())
-    if not keys:
-        return sums, counts
-
-    payload = torch.tensor(
-        [sums[k] for k in keys] + [counts[k] for k in keys],
-        dtype  = torch.float64,
-        device = get_device(),
-    )
-    all_reduce_sum_(payload)
-
-    n = len(keys)
-    reduced_sums   = {k: float(payload[i].item())     for i, k in enumerate(keys)}
-    reduced_counts = {k: float(payload[n + i].item()) for i, k in enumerate(keys)}
-    return reduced_sums, reduced_counts
+    reduced = {k: float(payload[i].item()) for i, k in enumerate(keys)}
+    return {k: reduced[k] for k in values}
 
 
 # --------------------------------------------------------------------------- #

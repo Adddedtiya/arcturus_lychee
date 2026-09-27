@@ -48,7 +48,6 @@ from arcturus_lychee.helpers.distributed import (
     get_device,
     all_reduce_sum_,
     all_reduce_max,
-    all_reduce_metric_sums,
 )
 
 # Data loaders and loader timing
