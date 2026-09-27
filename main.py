@@ -1,121 +1,130 @@
-"""Portable multi-/single-GPU training entrypoint.
+"""The entry script of a training. Start it with: python main.py
 
-Run it the same way everywhere - no launcher required:
+The script uses the visible GPUs:
 
-    python3 main_train_ddp.py
+  - Two or more GPUs: launch() starts one process for each GPU (DDP with NCCL).
+  - One GPU or the CPU: the training operates in this process, without DDP.
 
-Behaviour is decided at runtime from the visible GPUs:
-  * 2+ GPUs  -> one process per GPU (DistributedDataParallel over NCCL), spawned
-                internally by `launch()`.
-  * 1 GPU / CPU -> a single inline process, no distribution.
+The script does not need torchrun or ``python -m``. Thus the same command
+works in SLURM, Singularity, Docker, and a shell. To use fewer GPUs, set
+CUDA_VISIBLE_DEVICES, for example: CUDA_VISIBLE_DEVICES=0,1 python main.py
 
-Because it is a plain script (not `python -m ...`, not `torchrun`), it runs
-identically under SLURM, Docker, or a bare shell. `CUDA_VISIBLE_DEVICES` (e.g.
-what SLURM sets from --gres) is honoured automatically, so only allocated GPUs
-are used.
-
-`batch_size` in the config is the PER-GPU batch size; the effective global batch
-is `batch_size * num_gpus`.
+batch_size is the batch for each GPU. The global batch is batch_size x the
+number of GPUs.
 """
 
-import torch
+# Each process imports this file again. As a result:
+#   - A change to a file-level variable does not get to the other processes.
+#   - Code at file level operates one time in each process.
+# Put all values in build_config(). launch() gives the configuration to each process.
 
-from arcturus_lychee.configuration                         import TrainingConfiguration
-from arcturus_lychee.helpers                               import (
+import albumentations as A
+
+from arcturus_lychee.configuration                  import TrainingConfiguration, load_run_configuration
+from arcturus_lychee.helpers                        import (
     launch, set_seed, is_main_process,
     DirectoryTrainingLogger, NullLogger,
+    build_dataloader, describe_environment,
 )
-from arcturus_lychee.datasets                              import DirectoryClassification, heavy_aug
-from arcturus_lychee.trainers.basic_classification         import WrapperForClassification
-from arcturus_lychee.models.architecture.mobile_net        import BasicMobileNetV3
+from arcturus_lychee.datasets                       import DirectoryClassification, heavy_aug
+from arcturus_lychee.trainers.basic_classification  import ClassificationTrainer
+from arcturus_lychee.models.architecture.mobile_net import BasicMobileNetV3
 
 
 def build_config() -> TrainingConfiguration:
-    """Built in the PARENT process. Keep it CUDA-free: do not construct models
-    or touch tensors here (dtype stays lazily unresolved on purpose)."""
-    cfg = TrainingConfiguration()
+    """Make the configuration of this training.
 
-    cfg.working_directory = "results"
-    cfg.experiment_name   = "ddp_training"
+    The parent process calls this function before launch() starts the other
+    processes. Do not use CUDA here. Do not make models or tensors here.
+    """
+    configuration = TrainingConfiguration()
 
-    # dataset roots (edit these) - ImageFolder-style class subdirectories
-    cfg.dataset_root_train = "/path/to/dataset/train"
-    cfg.dataset_root_val   = "/path/to/dataset/val"
-    cfg.dataset_root_test  = "/path/to/dataset/test"
+    # To do an ablation, load the configuration of a previous run and change one value:
+    # configuration = load_run_configuration("results/2026_09_26_10_00-baseline")
+    # configuration.learning_rate   = 1e-4
+    # configuration.experiment_name = "baseline_lr_1e-4"
 
-    cfg.total_epochs       = 8
-    cfg.batch_size         = 32     # PER-GPU
-    cfg.total_workers      = 4
-    cfg.model_output_class = 40
+    configuration.working_directory = "results"
+    configuration.experiment_name   = "ddp_training"
 
-    # multi-GPU knobs (conservative defaults; opt in per experiment)
-    cfg.scale_lr_by_world_size = False   # set True for linear LR scaling
-    cfg.use_sync_batchnorm     = False   # set True if the per-GPU batch is small
-    return cfg
+    # Dataset directories, with one subdirectory for each class.
+    configuration.dataset_root_train = "/path/to/dataset/train"
+    configuration.dataset_root_val   = "/path/to/dataset/val"
+    configuration.dataset_root_test  = "/path/to/dataset/test"
+
+    configuration.total_epochs       = 8
+    configuration.batch_size         = 32      # For each GPU
+    configuration.total_workers      = 4       # Loader workers for each process
+    configuration.model_output_class = 40
+
+    # Distributed training. The defaults are safe. Change them for each experiment.
+    configuration.scale_lr_by_world_size = False   # True: learning_rate x the number of GPUs
+    configuration.use_sync_batchnorm     = False   # True: useful if the batch on each GPU is small
+    return configuration
 
 
-def worker(rank: int, world_size: int, cfg: TrainingConfiguration) -> None:
-    """Runs once per GPU (or once total on a single GPU / CPU)."""
+def worker(rank : int, world_size : int, configuration : TrainingConfiguration) -> None:
+    """Train on one GPU. launch() calls this function one time in each process."""
 
-    # this process already owns its GPU (pinned by setup_distributed); record it
-    if torch.cuda.is_available():
-        cfg.device = torch.device("cuda", torch.cuda.current_device())
+    # The same seed on each rank gives the same start weights.
+    # DDP also copies the weights of rank 0 to the other ranks.
+    set_seed(configuration.seed, configuration.deterministic)
 
-    # identical base seed on every rank -> identical weight init + a consistent
-    # DistributedSampler partition. DDP also broadcasts rank-0 weights at wrap.
-    set_seed(cfg.seed, cfg.deterministic)
+    # Only rank 0 writes files. The other ranks get a logger that does nothing.
+    logger      = DirectoryTrainingLogger(configuration) if is_main_process() else NullLogger()
+    environment = describe_environment(configuration, world_size)
+    logger.log(environment)
+    logger.record.save_text("environment.txt", environment)
 
-    # only rank 0 does disk I/O; other ranks get a no-op logger
-    logger = DirectoryTrainingLogger(cfg) if is_main_process() else NullLogger()
+    model   = BasicMobileNetV3(output_classes = configuration.model_output_class)
+    trainer = ClassificationTrainer(model, configuration, logger)
 
-    model   = BasicMobileNetV3(output_classes = cfg.model_output_class)
-    wrapper = WrapperForClassification(model = model, configuration = cfg, logger = logger)
-
-    # ---- training data: sharded across ranks under DDP ----
-    train_ds  = DirectoryClassification(cfg.dataset_root_train, augmentation = heavy_aug(), seed = cfg.seed)
-    train_gen = torch.Generator().manual_seed(cfg.seed)   # reproducible shuffling
-    train_loader = train_ds.create_dataloader(
-        batch_size    = cfg.batch_size,
-        total_workers = cfg.total_workers,
-        device        = cfg.device,
-        shuffle       = True,
-        generator     = train_gen,
-        distributed   = (world_size > 1),
-        seed          = cfg.seed,
+    # Training data. With DDP, each rank gets a different part of the dataset.
+    train_set    = DirectoryClassification(
+        configuration.dataset_root_train,
+        augmentation = heavy_aug(),
+        training     = True,
+        seed         = configuration.seed,
     )
+    train_loader = build_dataloader(
+        train_set,
+        batch_size    = configuration.batch_size,
+        total_workers = configuration.total_workers,
+        shuffle       = True,
+        distributed   = world_size > 1,
+        seed          = configuration.seed,
+    )
+    logger.record.save_json("augmentation_train.json", A.to_dict(train_set.augmentation))
+    logger.record.save_text("class_names.txt", train_set.class_names)
 
-    # ---- eval data: rank 0 only, plain loader, no shuffle ----
+    # Evaluation data: rank 0 only, without shuffle.
     eval_loader = None
     if is_main_process():
-        val_ds = DirectoryClassification(cfg.dataset_root_val, seed = cfg.seed)
-        eval_loader = val_ds.create_dataloader(
-            batch_size    = cfg.batch_size,
-            total_workers = cfg.total_workers,
-            device        = cfg.device,
+        eval_set    = DirectoryClassification(configuration.dataset_root_val, training = False)
+        eval_loader = build_dataloader(
+            eval_set,
+            batch_size    = configuration.batch_size,
+            total_workers = configuration.total_workers,
             shuffle       = False,
         )
+        logger.record.save_json("augmentation_eval.json", A.to_dict(eval_set.augmentation))
 
-    wrapper.run_everything(
-        train_dataloader = train_loader,
-        test_dataloader  = eval_loader,
-        test_every       = cfg.test_every_n,
-        save_every       = cfg.save_every_n,
-    )
+    trainer.fit(train_loader, eval_loader)
 
-    # ---- final report on the best checkpoint: rank 0 only ----
+    # Last report with the best checkpoint: rank 0 only.
     if is_main_process():
-        test_ds     = DirectoryClassification(cfg.dataset_root_test, seed = cfg.seed)
-        test_loader = test_ds.create_dataloader(batch_size = cfg.batch_size, shuffle = False)
-        wrapper.load_state(logger.get_weights_path("best.pt"))
-        wrapper.test_model(
-            test_dataloader = test_loader,
-            report_prefix   = "Best",
-            class_names     = test_ds.class_names,
+        test_set    = DirectoryClassification(configuration.dataset_root_test, training = False)
+        test_loader = build_dataloader(
+            test_set,
+            batch_size    = configuration.batch_size,
+            total_workers = configuration.total_workers,
+            shuffle       = False,
         )
+        trainer.load_state(logger.get_weights_path("best.pt"))
+        trainer.report(test_loader, "Best", class_names = test_set.class_names)
 
 
 if __name__ == "__main__":
-    print("Train Start !")
     configuration = build_config()
     launch(
         worker,
